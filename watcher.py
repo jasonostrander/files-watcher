@@ -8,6 +8,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from collections import Counter
 
@@ -74,21 +75,37 @@ def count_open_files() -> tuple[
     return counts, names, histograms, details
 
 
-def notify(title: str, message: str) -> None:
+def _run_alerter_and_handle_click(cmd: list[str], reveal_path: str | None) -> None:
+    """Run alerter (blocks until user interacts); reveal `reveal_path` in Finder on body click."""
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    except OSError:
+        return
+    if reveal_path and result.stdout.strip() == "@CONTENTCLICKED":
+        subprocess.run(["open", "-R", reveal_path], check=False)
+
+
+def notify(title: str, message: str, reveal_path: str | None = None) -> None:
     """Display a native macOS notification.
 
-    Prefers `alerter` (Apple Silicon native, actively maintained) so clicking
-    the banner doesn't launch Script Editor; falls back to osascript when
-    alerter isn't installed.
+    Prefers `alerter` (Apple Silicon native, actively maintained). When
+    `reveal_path` is given, clicking the banner body opens Finder with that
+    path revealed. Falls back to osascript when alerter isn't installed.
     """
     alerter = shutil.which("alerter")
     if alerter:
-        # No --actions, so clicks just dismiss.
-        # --sender attributes the banner (and icon) to Terminal.
-        subprocess.run(
-            [alerter, "--title", title, "--message", message, "--sender", "com.apple.Terminal"],
-            check=False,
-        )
+        # alerter blocks until the user clicks / dismisses / times out, so
+        # run it in a daemon thread to keep the polling loop alive. --sender
+        # spoofs Terminal's icon for nicer attribution, but click events still
+        # reach alerter's NSUserNotificationCenterDelegate while alerter is
+        # alive (vjeantet/alerter NotificationManager.swift userNotificationCenter:didActivate:),
+        # so the @CONTENTCLICKED handoff still works.
+        cmd = [alerter, "--title", title, "--message", message, "--sender", "com.apple.Terminal"]
+        threading.Thread(
+            target=_run_alerter_and_handle_click,
+            args=(cmd, reveal_path),
+            daemon=True,
+        ).start()
         return
 
     safe_title = title.replace("\\", "\\\\").replace('"', '\\"')
@@ -407,7 +424,12 @@ def main() -> int:
             "Open files threshold exceeded",
             "test (PID 0) has 99999 open files",
         )
-        print("sent test notification", flush=True)
+        print("sent test notification (waiting up to 60s for click/dismiss)", flush=True)
+        # The notify() thread is a daemon; wait briefly so a quick click can
+        # still trigger reveal-in-Finder before the process exits.
+        for t in threading.enumerate():
+            if t is not threading.main_thread():
+                t.join(timeout=60)
         return 0
 
     if args.stop:
@@ -462,8 +484,8 @@ def main() -> int:
                 title = "Open files threshold exceeded"
                 message = f"{name} (PID {pid}) has {n} open files"
                 if snapshot_path:
-                    message += f"\nsnapshot: {snapshot_path}"
-                notify(title, message)
+                    message += "\nClick to reveal snapshot in Finder"
+                notify(title, message, reveal_path=snapshot_path)
                 print(f"NOTIFY: {message}", flush=True)
                 if snapshot_path:
                     print(f"SNAPSHOT: {snapshot_path}", flush=True)
