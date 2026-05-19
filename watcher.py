@@ -12,12 +12,23 @@ import time
 from collections import Counter
 
 
-def count_open_files() -> Counter:
-    """Return a Counter mapping PID -> open file descriptor count."""
-    # -n: no DNS resolution (fast). -P: numeric ports. -w: suppress warnings.
-    # -F pn: machine-readable, only PID and command name fields per record.
+def count_open_files() -> tuple[
+    Counter,
+    dict[int, str],
+    dict[int, Counter],
+    dict[int, list[tuple[str, str, str]]],
+]:
+    """Scan all open FDs once, returning counts/names/histograms/details per PID.
+
+    Capturing per-FD detail in this same pass (rather than re-running `lsof -p <pid>`
+    after a breach is detected) avoids racing short-lived processes that exit before
+    the follow-up query can read their FD table.
+    """
+    # -n: no DNS resolution. -P: numeric ports. -w: suppress warnings.
+    # -F pcftn: machine-readable, one tag per line — p (pid), c (command),
+    # f (fd num), t (type), n (name). Each FD appears as f→t→n.
     result = subprocess.run(
-        ["lsof", "-n", "-P", "-w", "-F", "pcn"],
+        ["lsof", "-n", "-P", "-w", "-F", "pcftn"],
         capture_output=True,
         text=True,
         check=False,
@@ -25,8 +36,12 @@ def count_open_files() -> Counter:
 
     counts: Counter = Counter()
     names: dict[int, str] = {}
+    histograms: dict[int, Counter] = {}
+    details: dict[int, list[tuple[str, str, str]]] = {}
+
     current_pid: int | None = None
-    current_name: str | None = None
+    current_fd: str | None = None
+    current_type: str | None = None
 
     for line in result.stdout.splitlines():
         if not line:
@@ -37,30 +52,41 @@ def count_open_files() -> Counter:
                 current_pid = int(value)
             except ValueError:
                 current_pid = None
-            current_name = None
+            current_fd = None
+            current_type = None
         elif tag == "c" and current_pid is not None:
-            current_name = value
             names[current_pid] = value
+        elif tag == "f" and current_pid is not None:
+            current_fd = value
+            current_type = None
+        elif tag == "t" and current_pid is not None:
+            current_type = value
         elif tag == "n" and current_pid is not None:
             counts[current_pid] += 1
+            fd_type = current_type or "?"
+            histograms.setdefault(current_pid, Counter())[fd_type] += 1
+            details.setdefault(current_pid, []).append(
+                (current_fd or "?", fd_type, value)
+            )
+            current_fd = None
+            current_type = None
 
-    # Attach names alongside counts via a side dict on the Counter.
-    counts._names = names  # type: ignore[attr-defined]
-    return counts
+    return counts, names, histograms, details
 
 
 def notify(title: str, message: str) -> None:
     """Display a native macOS notification.
 
-    Prefers terminal-notifier so clicking the banner doesn't launch Script Editor;
-    falls back to osascript when terminal-notifier isn't installed.
+    Prefers `alerter` (Apple Silicon native, actively maintained) so clicking
+    the banner doesn't launch Script Editor; falls back to osascript when
+    alerter isn't installed.
     """
-    tn = shutil.which("terminal-notifier")
-    if tn:
-        # No -activate / -execute / -open, so clicks just dismiss.
-        # -sender attributes the banner (and icon) to Terminal.
+    alerter = shutil.which("alerter")
+    if alerter:
+        # No --actions, so clicks just dismiss.
+        # --sender attributes the banner (and icon) to Terminal.
         subprocess.run(
-            [tn, "-title", title, "-message", message, "-sender", "com.apple.Terminal"],
+            [alerter, "--title", title, "--message", message, "--sender", "com.apple.Terminal"],
             check=False,
         )
         return
@@ -73,8 +99,48 @@ def notify(title: str, message: str) -> None:
 
 DEFAULT_LOG = os.path.expanduser("~/Library/Logs/files-watcher.log")
 DEFAULT_PIDFILE = os.path.expanduser("~/Library/Logs/files-watcher.pid")
+DEFAULT_SNAPSHOT_DIR = os.path.expanduser("~/Library/Logs/files-watcher-snapshots")
 LAUNCHD_LABEL = "local.files-watcher"
 LAUNCHD_PLIST = os.path.expanduser(f"~/Library/LaunchAgents/{LAUNCHD_LABEL}.plist")
+
+
+def snapshot_process(
+    pid: int,
+    name: str,
+    count: int,
+    threshold: int,
+    histogram: Counter,
+    fds: list[tuple[str, str, str]],
+    snapshot_dir: str,
+) -> str | None:
+    """Write a snapshot of the offending PID's FDs from data captured at detection time.
+
+    Returns the path written, or None if snapshotting was disabled.
+    """
+    if not snapshot_dir:
+        return None
+
+    os.makedirs(snapshot_dir, exist_ok=True)
+    ts = time.strftime("%Y-%m-%dT%H-%M-%S")
+    safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in name) or "unknown"
+    path = os.path.join(snapshot_dir, f"{ts}-{safe_name}-{pid}.txt")
+
+    with open(path, "w") as f:
+        f.write(f"# files-watcher snapshot\n")
+        f.write(f"# captured: {time.strftime('%Y-%m-%d %H:%M:%S %z')}\n")
+        f.write(f"# pid: {pid}\n")
+        f.write(f"# command: {name}\n")
+        f.write(f"# open files at detection: {count}\n")
+        f.write(f"# threshold: {threshold}\n")
+        f.write(f"# fds captured: {len(fds)}\n")
+        f.write("\n## FD type histogram\n")
+        for fd_type, n in histogram.most_common():
+            f.write(f"{n:>8}  {fd_type}\n")
+        f.write("\n## FD detail (fd, type, name)\n")
+        for fd, fd_type, fd_name in fds:
+            f.write(f"{fd:>6}  {fd_type:<10}  {fd_name}\n")
+
+    return path
 
 
 def daemonize(log_file: str, pidfile: str) -> None:
@@ -326,6 +392,14 @@ def main() -> int:
         default=DEFAULT_PIDFILE,
         help=f"pidfile when running with --daemon (default: {DEFAULT_PIDFILE})",
     )
+    parser.add_argument(
+        "--snapshot-dir",
+        default=DEFAULT_SNAPSHOT_DIR,
+        help=(
+            "directory where per-trip lsof snapshots are written; "
+            f"set to '' to disable (default: {DEFAULT_SNAPSHOT_DIR})"
+        ),
+    )
     args = parser.parse_args()
 
     if args.test_notification:
@@ -358,13 +432,12 @@ def main() -> int:
 
     while True:
         try:
-            counts = count_open_files()
+            counts, names, histograms, details = count_open_files()
         except FileNotFoundError:
             print("lsof not found; this tool requires macOS / Unix.", file=sys.stderr)
             return 1
 
         top = counts.most_common(args.top)
-        names: dict[int, str] = getattr(counts, "_names", {})
 
         if args.verbose:
             ts = time.strftime("%H:%M:%S")
@@ -377,10 +450,23 @@ def main() -> int:
         for pid, n in top:
             if n >= args.threshold and pid not in notified:
                 name = names.get(pid, "unknown")
+                snapshot_path = snapshot_process(
+                    pid,
+                    name,
+                    n,
+                    args.threshold,
+                    histograms.get(pid, Counter()),
+                    details.get(pid, []),
+                    args.snapshot_dir,
+                )
                 title = "Open files threshold exceeded"
                 message = f"{name} (PID {pid}) has {n} open files"
+                if snapshot_path:
+                    message += f"\nsnapshot: {snapshot_path}"
                 notify(title, message)
                 print(f"NOTIFY: {message}", flush=True)
+                if snapshot_path:
+                    print(f"SNAPSHOT: {snapshot_path}", flush=True)
                 notified.add(pid)
 
         # Allow re-notification once a PID drops out of the top set or below threshold.
