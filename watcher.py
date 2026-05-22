@@ -2,6 +2,8 @@
 """Monitor top processes by open file count and notify when one exceeds a threshold."""
 
 import argparse
+import ctypes
+import ctypes.util
 import errno
 import os
 import shutil
@@ -73,6 +75,70 @@ def count_open_files() -> tuple[
             current_type = None
 
     return counts, names, histograms, details
+
+
+_LIBC: ctypes.CDLL | None = None
+
+
+def _libc() -> ctypes.CDLL:
+    global _LIBC
+    if _LIBC is None:
+        _LIBC = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    return _LIBC
+
+
+def sysctl_int(name: str) -> int | None:
+    """Read an integer sysctl via libc.sysctlbyname.
+
+    Used instead of `subprocess.run(["sysctl", ...])` so the system-FD probe
+    keeps working even when the kernel file table is exhausted (ENFILE) and
+    fork/exec is failing — exactly the condition this watcher needs to react to.
+    """
+    val = ctypes.c_int(0)
+    size = ctypes.c_size_t(ctypes.sizeof(val))
+    rc = _libc().sysctlbyname(
+        name.encode(), ctypes.byref(val), ctypes.byref(size), None, 0
+    )
+    if rc != 0:
+        return None
+    return val.value
+
+
+def system_fd_pressure() -> tuple[int, int] | None:
+    """Return (kern.num_files, kern.maxfiles), or None if either lookup fails."""
+    num = sysctl_int("kern.num_files")
+    cap = sysctl_int("kern.maxfiles")
+    if num is None or cap is None or cap <= 0:
+        return None
+    return num, cap
+
+
+def kill_pid(pid: int, sigterm_timeout: float = 3.0) -> str:
+    """SIGTERM, poll for up to `sigterm_timeout`, then SIGKILL if still alive.
+
+    Returns one of: 'TERM' (exited on SIGTERM), 'KILL' (escalated to SIGKILL),
+    'GONE' (already dead before signal), or 'DENIED' (no permission).
+    """
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return "GONE"
+    except PermissionError:
+        return "DENIED"
+
+    deadline = time.monotonic() + sigterm_timeout
+    while time.monotonic() < deadline:
+        time.sleep(0.1)
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return "TERM"
+
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return "TERM"
+    return "KILL"
 
 
 def _run_alerter_and_handle_click(cmd: list[str], reveal_path: str | None) -> None:
@@ -417,6 +483,30 @@ def main() -> int:
             f"set to '' to disable (default: {DEFAULT_SNAPSHOT_DIR})"
         ),
     )
+    parser.add_argument(
+        "--kill-ratio",
+        type=float,
+        default=0.70,
+        help=(
+            "system-wide FD-pressure ratio (kern.num_files / kern.maxfiles) at "
+            "which the watcher will start killing matching processes "
+            "(default: 0.70)"
+        ),
+    )
+    parser.add_argument(
+        "--kill-comm",
+        default="claude",
+        help=(
+            "comm name (lsof 'c' field) eligible to be killed under FD pressure. "
+            "Defaults to 'claude' — matches the Claude Code CLI but not the "
+            "/Applications/Claude.app desktop client (comm 'Claude')."
+        ),
+    )
+    parser.add_argument(
+        "--no-kill",
+        action="store_true",
+        help="disable coercive kill action; only notify on FD pressure",
+    )
     args = parser.parse_args()
 
     if args.test_notification:
@@ -460,12 +550,20 @@ def main() -> int:
             return 1
 
         top = counts.most_common(args.top)
+        pressure = system_fd_pressure()
 
         if args.verbose:
             ts = time.strftime("%H:%M:%S")
             print(f"[{ts}] top {args.top} by open files:", flush=True)
             for pid, n in top:
                 print(f"  {n:>6}  {pid:>6}  {names.get(pid, '?')}", flush=True)
+            if pressure is not None:
+                num, cap = pressure
+                print(
+                    f"  system: {num}/{cap} ({num/cap:.1%}) "
+                    f"kill_ratio={args.kill_ratio:.0%}",
+                    flush=True,
+                )
 
         live_pids = {pid for pid, _ in top}
 
@@ -490,6 +588,46 @@ def main() -> int:
                 if snapshot_path:
                     print(f"SNAPSHOT: {snapshot_path}", flush=True)
                 notified.add(pid)
+
+        # Coercive action: under system-wide FD pressure, kill the highest-FD
+        # matching process (one per cycle — re-evaluate next tick rather than
+        # nuking every session at once).
+        if not args.no_kill and pressure is not None:
+            num, cap = pressure
+            if num >= args.kill_ratio * cap:
+                candidates = sorted(
+                    (
+                        (pid, n)
+                        for pid, n in counts.items()
+                        if names.get(pid) == args.kill_comm
+                    ),
+                    key=lambda x: x[1],
+                    reverse=True,
+                )
+                if candidates:
+                    target_pid, target_fds = candidates[0]
+                    ratio = num / cap
+                    print(
+                        f"COERCIVE KILL: system at {num}/{cap} ({ratio:.1%} >= "
+                        f"{args.kill_ratio:.0%}); killing {args.kill_comm} "
+                        f"PID {target_pid} ({target_fds} FDs)",
+                        flush=True,
+                    )
+                    outcome = kill_pid(target_pid)
+                    title = f"Killed {args.kill_comm} (FD pressure)"
+                    message = (
+                        f"system FDs {ratio:.0%} of limit ({num}/{cap})\n"
+                        f"{args.kill_comm} PID {target_pid} "
+                        f"holding {target_fds} FDs — {outcome}"
+                    )
+                    notify(title, message)
+                    print(f"KILL OUTCOME: {outcome}", flush=True)
+                else:
+                    print(
+                        f"FD PRESSURE: system at {num}/{cap} ({num/cap:.1%}) "
+                        f"but no '{args.kill_comm}' processes to kill",
+                        flush=True,
+                    )
 
         # Allow re-notification once a PID drops out of the top set or below threshold.
         notified &= live_pids
